@@ -76,7 +76,7 @@ def render_details_block(item: dict) -> str:
         f"- **السعر للشخص:** {pricepp}\n"
         f"- **الطبق المميز:** {dish}\n"
         f"- **أوقات الزحمة:** {busy}\n"
-        f"- **خرائط Google:** {mapslnk}\n"
+        f"- **خرائط Google:** {mapslnك}\n"
         f"- **الموقع الإلكتروني:** {webslnk}\n"
     )
 
@@ -368,7 +368,7 @@ with tab_article:
         else:
             criteria_block = st.session_state.get("criteria_generated_md_map", {}).get(effective_category, criteria_block)
 
-        # 🔁 (تعديل المرحلة 6): القراءة الافتراضية من session_state لو جاي من تبويب Google
+        # يقرأ الأسماء التي أضيفت من تبويب Google (إن وُجدت)
         restaurants_input = st.text_area(
             "أدخل أسماء المطاعم (سطر لكل مطعم)",
             st.session_state.get("restaurants_text", "مطعم 1\nمطعم 2\nمطعم 3"),
@@ -478,7 +478,7 @@ with tab_article:
             except Exception as e:
                 st.warning(f"طبقة اللمسات البشرية تعذّرت: {e}")
 
-        # 🔁 (المرحلة 7): حقن البطاقات المحمية 100% تحت كل H3 قبل الMeta/Links
+        # 🔁 حقن البطاقات المحمية 100% تحت كل H3 قبل الMeta/Links
         if "places_index" in st.session_state and st.session_state["places_index"]:
             article_md = inject_details_under_h3(article_md, st.session_state["places_index"])
 
@@ -661,82 +661,59 @@ with tab_places:
     from utils.integrations.places_core import (
         CITY_PRESETS,
         places_search_text,
-        place_details,
+        make_items_from_places,
     )
-    # إن كانت لديك دوال إضافية في places_core:
-    try:
-        from utils.integrations.places_core import extract_thursday_times, map_price_level_to_range
-    except Exception:
-        extract_thursday_times = None
-        map_price_level_to_range = None
+
+    # مفتاح Google من الأسرار
+    api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        st.error("GOOGLE_API_KEY غير موجود في secrets.")
+        st.stop()
 
     query = st.text_input("🔎 استعلام البحث (مثال: برجر بالرياض، بخاري جدة...)")
     city_key = st.selectbox("🏙️ اختر مدينة", list(CITY_PRESETS.keys()))
     max_results = st.number_input("🔢 الحد الأقصى للنتائج", min_value=1, max_value=20, value=10)
     min_reviews = st.number_input("⭐ الحد الأدنى لعدد المراجعات", min_value=0, value=50)
 
-    def to_place_item(det: dict) -> dict:
-        name = (det.get("displayName") or {}).get("text") or ""
-        address = det.get("formattedAddress")
-        phone = det.get("nationalPhoneNumber")
-
-        # ساعات الخميس كسلسلة واحدة (بدون ذكر اليوم)
-        thu = None
-        if extract_thursday_times and det.get("regularOpeningHours"):
-            try:
-                thu = extract_thursday_times(det.get("regularOpeningHours", {})) or None
-            except Exception:
-                thu = None
-
-        # السعر للشخص
-        price_pp = None
-        lvl = det.get("priceLevel")
-        if lvl is not None and map_price_level_to_range:
-            try:
-                region = CITY_PRESETS[city_key].get("regionCode", "SA")
-                price_pp = map_price_level_to_range(lvl, region)
-            except Exception:
-                price_pp = None
-
-        busy = det.get("busy_times")  # قد لا تكون متوفرة
-
-        maps_url = det.get("googleMapsUri")
-        website  = det.get("websiteUri")
-
-        return {
-            "name": name,
-            "address": address,
-            "phone": phone,
-            "thursday_hours": thu,
-            "family_friendly": "نعم (تقديري)",  # حسب قرارك
-            "price_per_person": price_pp,
-            "signature_dish": "—",
-            "busy_times": busy,
-            "maps_url": maps_url,
-            "website": website,
-        }
-
     if st.button("🚀 جلب النتائج"):
         if not query:
             st.warning("اكتب استعلامًا أولًا.")
         else:
-            base_city = CITY_PRESETS[city_key]
-            results = places_search_text(
+            # 1) بحث نصي حسب تواقيع places_core
+            places = places_search_text(
+                api_key,
                 query,
-                base_city["lat"],
-                base_city["lng"],
+                city_key,                      # مفتاح المدينة كما في CITY_PRESETS
                 max_results=int(max_results),
-                region_code=base_city.get("regionCode", "SA")
             )
 
-            items = []
-            for p in results:
-                det = place_details(p["id"])
-                if min_reviews:
-                    if det.get("userRatingCount") is not None and det["userRatingCount"] < int(min_reviews):
-                        continue
-                items.append(to_place_item(det))
+            # 2) بناء عناصر جاهزة بالحقول المطلوبة
+            region_code = CITY_PRESETS[city_key].get("regionCode", "SA")
+            items_raw = make_items_from_places(
+                api_key,
+                places,
+                min_reviews=int(min_reviews),
+                region_code=region_code,
+            )
 
+            # 3) تحويل مفاتيح places_core إلى صيغة البطاقات المحمية
+            def convert_item(r: dict) -> dict:
+                return {
+                    "name": r.get("name", ""),
+                    "address": r.get("address"),
+                    "phone": r.get("phone"),
+                    "thursday_hours": r.get("thursday_hours"),
+                    "family_friendly": r.get("family_friendly") or "نعم (تقديري)",
+                    "price_per_person": r.get("price_range"),
+                    "signature_dish": r.get("signature_dish") or "—",
+                    "busy_times": r.get("crowd_note"),
+                    "maps_url": r.get("maps_uri"),
+                    "website": r.get("website"),
+                }
+
+            items = [convert_item(r) for r in items_raw]
+
+            # 4) تخزين في الجلسة + فهرس بالأسماء المطبَّعة
             st.session_state["places_items"] = items
             st.session_state["places_index"] = { normalize_ar(it["name"]): it for it in items }
 
