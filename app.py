@@ -555,26 +555,49 @@ with tab_article:
             json_data = st.session_state.get('last_json', '{}')
             st.download_button('🧩 تنزيل JSON', data=json_data, file_name='article.json', mime='application/json')
 
-    # ==== النشر على ووردبريس ====
+    # ==== النشر على ووردبريس (مع تشخيص المفاتيح) ====
     st.markdown("---")
     st.subheader("📰 النشر على ووردبريس")
-    wp_ready = all(k in st.secrets for k in ("WP_BASE_URL", "WP_USER", "WP_APP_PASS")) or \
-               all(os.getenv(k) for k in ("WP_BASE_URL", "WP_USER", "WP_APP_PASS"))
+
+    def _get_secret(name: str):
+        v = None
+        try:
+            if hasattr(st, "secrets"):
+                v = st.secrets.get(name)
+        except Exception:
+            v = None
+        if not v:
+            v = os.getenv(name)
+        if isinstance(v, str):
+            v = v.strip()
+        return v
+
+    wp_base = _get_secret("WP_BASE_URL")
+    wp_user = _get_secret("WP_USER")
+    wp_pass = _get_secret("WP_APP_PASS")
+    wp_ready = all([wp_base, wp_user, wp_pass])
+
+    # سطر تشخيصي بسيط (لا يعرض القيم)
+    st.caption(
+        f"WP_BASE_URL: {'OK' if wp_base else 'MISSING'} · "
+        f"WP_USER: {'OK' if wp_user else 'MISSING'} · "
+        f"WP_APP_PASS: {'OK' if wp_pass else 'MISSING'}"
+    )
+
+    current_title = st.session_state.get("last_title") or ""
+    default_slug = slugify(current_title) if current_title else slugify(st.session_state.get('last_article_md', '')[:40] or "article")
+
+    pcol1, pcol2 = st.columns([2,1])
+    with pcol1:
+        wp_slug = st.text_input("Slug (اختياري)", default_slug)
+        wp_status = st.selectbox("الحالة", ["draft", "pending", "publish"], index=0)
+    with pcol2:
+        cattxt = st.text_input("IDs للتصنيفات (اختياري، مفصولة بفواصل)", "")
+        tagtxt = st.text_input("IDs للوسوم (اختياري، مفصولة بفواصل)", "")
 
     if not wp_ready:
-        st.info("للاستخدام، أضف WP_BASE_URL و WP_USER و WP_APP_PASS إلى secrets.toml")
+        st.info("المفاتيح ناقصة أو فارغة. أضف WP_BASE_URL و WP_USER و WP_APP_PASS إلى secrets.toml ثم اضغط Restart.")
     else:
-        current_title = st.session_state.get("last_title") or ""
-        default_slug = slugify(current_title) if current_title else slugify(st.session_state.get('last_article_md', '')[:40] or "article")
-
-        pcol1, pcol2 = st.columns([2,1])
-        with pcol1:
-            wp_slug = st.text_input("Slug (اختياري)", default_slug)
-            wp_status = st.selectbox("الحالة", ["draft", "pending", "publish"], index=0)
-        with pcol2:
-            cattxt = st.text_input("IDs للتصنيفات (اختياري، مفصولة بفواصل)", "")
-            tagtxt = st.text_input("IDs للوسوم (اختياري، مفصولة بفواصل)", "")
-
         if st.button("🚀 نشر كمسودة على ووردبريس"):
             article_md_to_publish = st.session_state.get('last_article_md', '')
             if not article_md_to_publish.strip():
