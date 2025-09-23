@@ -21,6 +21,10 @@ from utils.competitor_analysis import analyze_competitors, extract_gap_points
 from utils.quality_checks import quality_report
 from utils.llm_reviewer import llm_review, llm_fix
 
+# إضافات ووردبريس
+import requests
+import markdown as md  # لتحويل Markdown إلى HTML قبل النشر
+
 # ========== Helpers for Places Integration (normalize + protected details) ==========
 import re, unicodedata as _ud
 from difflib import SequenceMatcher
@@ -122,6 +126,34 @@ def inject_details_under_h3(markdown_text: str, places_index: dict) -> str:
     return "\n".join(out)
 # ========== End Helpers ======================================================
 
+# ========== WordPress helper ==========
+def wp_publish_draft(title: str, markdown_body: str, slug: str = None,
+                     categories=None, tags=None, status: str = "draft") -> dict:
+    """
+    ينشر المقال كمسودة على ووردبريس عبر REST API.
+    المتطلبات في secrets.toml:
+      WP_BASE_URL, WP_USER, WP_APP_PASS
+    """
+    base = (st.secrets.get("WP_BASE_URL") or os.getenv("WP_BASE_URL") or "").rstrip("/")
+    user = st.secrets.get("WP_USER") or os.getenv("WP_USER")
+    app_pass = st.secrets.get("WP_APP_PASS") or os.getenv("WP_APP_PASS")
+    if not base or not user or not app_pass:
+        raise RuntimeError("بيانات ووردبريس ناقصة: WP_BASE_URL / WP_USER / WP_APP_PASS")
+
+    # تحويل Markdown → HTML
+    html = md.markdown(markdown_body or "", extensions=["extra", "sane_lists"])
+
+    url = f"{base}/wp-json/wp/v2/posts"
+    payload = {"title": title or "بدون عنوان", "content": html, "status": status}
+    if slug: payload["slug"] = slug
+    if categories: payload["categories"] = categories
+    if tags: payload["tags"] = tags
+
+    resp = requests.post(url, json=payload, auth=(user, app_pass), timeout=45)
+    resp.raise_for_status()
+    return resp.json()
+# ======================================
+
 # --- rerun آمن لنسخ ستريملت المختلفة ---
 def safe_rerun():
     if getattr(st, "rerun", None):
@@ -174,7 +206,7 @@ PLACE_TEMPLATES = {
 def build_protip_hint(place_type: str) -> str:
     return PLACE_TEMPLATES.get(place_type or "", "قدّم نصيحة عملية مرتبطة بالمكان والذروة وسهولة الوصول.")
 def build_place_context(place_type: str, place_name: str, place_rules: str, strict: bool) -> str:
-    scope = "صارم (التزم داخل النطاق فقط)" if strict else "مرن (الأولوية داخل النطاق)"
+    scope = "صارم (التزم بالنطاق فقط)" if strict else "مرن (الأولوية داخل النطاق)"
     return f"""سياق المكان:
 - النوع: {place_type or "غير محدد"}
 - الاسم: {place_name or "غير محدد"}
@@ -344,14 +376,14 @@ with tab_article:
                     use_llm=use_llm,
                     catalog_path="data/criteria_catalog.yaml"
                 )
-                md = _format_criteria_md(crit_list)
+                md_ = _format_criteria_md(crit_list)
                 # نظّف أي قيمة قديمة مخزنة
                 st.session_state["criteria_generated_md_map"].pop(effective_category, None)
-                st.session_state["criteria_generated_md_map"][effective_category] = md
+                st.session_state["criteria_generated_md_map"][effective_category] = md_
 
                 if is_custom_category:
                     # لا نلمس مفتاح الويجت مباشرة؛ نحفظ قيمة معلّقة ثم rerun
-                    st.session_state["pending_custom_criteria_text"] = md
+                    st.session_state["pending_custom_criteria_text"] = md_
                     safe_rerun()
                 else:
                     st.success("تم توليد المعايير وحفظها.")
@@ -498,6 +530,7 @@ with tab_article:
         st.subheader("📄 المقال الناتج")
         st.markdown(article_md)
         st.session_state['last_article_md'] = article_md
+        st.session_state['last_title'] = article_title  # لحساب slug للنشر
 
         st.subheader("🔎 Meta (SEO)"); st.code(meta_out, language="text")
         st.subheader("🔗 روابط داخلية مقترحة"); st.markdown(links_out)
@@ -521,6 +554,49 @@ with tab_article:
         with colC:
             json_data = st.session_state.get('last_json', '{}')
             st.download_button('🧩 تنزيل JSON', data=json_data, file_name='article.json', mime='application/json')
+
+    # ==== النشر على ووردبريس ====
+    st.markdown("---")
+    st.subheader("📰 النشر على ووردبريس")
+    wp_ready = all(k in st.secrets for k in ("WP_BASE_URL", "WP_USER", "WP_APP_PASS")) or \
+               all(os.getenv(k) for k in ("WP_BASE_URL", "WP_USER", "WP_APP_PASS"))
+
+    if not wp_ready:
+        st.info("للاستخدام، أضف WP_BASE_URL و WP_USER و WP_APP_PASS إلى secrets.toml")
+    else:
+        current_title = st.session_state.get("last_title") or ""
+        default_slug = slugify(current_title) if current_title else slugify(st.session_state.get('last_article_md', '')[:40] or "article")
+
+        pcol1, pcol2 = st.columns([2,1])
+        with pcol1:
+            wp_slug = st.text_input("Slug (اختياري)", default_slug)
+            wp_status = st.selectbox("الحالة", ["draft", "pending", "publish"], index=0)
+        with pcol2:
+            cattxt = st.text_input("IDs للتصنيفات (اختياري، مفصولة بفواصل)", "")
+            tagtxt = st.text_input("IDs للوسوم (اختياري، مفصولة بفواصل)", "")
+
+        if st.button("🚀 نشر كمسودة على ووردبريس"):
+            article_md_to_publish = st.session_state.get('last_article_md', '')
+            if not article_md_to_publish.strip():
+                st.warning("لا يوجد نص مقال لنشره. أنشئ المقال أولًا.")
+            else:
+                try:
+                    cats = [int(x) for x in cattxt.split(",") if x.strip().isdigit()] if cattxt.strip() else None
+                    tags = [int(x) for x in tagtxt.split(",") if x.strip().isdigit()] if tagtxt.strip() else None
+                    res = wp_publish_draft(
+                        title=current_title or "مقال جديد",
+                        markdown_body=article_md_to_publish,
+                        slug=wp_slug or None,
+                        categories=cats,
+                        tags=tags,
+                        status=wp_status,
+                    )
+                    st.success(f"تم إنشاء منشور (ID={res.get('id')}) بحالة {res.get('status')}.")
+                    link = res.get("link") or (res.get("guid") or {}).get("rendered")
+                    if link:
+                        st.markdown(f"[فتح في ووردبريس]({link})")
+                except Exception as e:
+                    st.error(f"فشل النشر: {e}")
 
 # ------------------ Tab 2: Competitor Analysis ------------------
 with tab_comp:
