@@ -76,7 +76,7 @@ def render_details_block(item: dict) -> str:
         f"- **السعر للشخص:** {pricepp}\n"
         f"- **الطبق المميز:** {dish}\n"
         f"- **أوقات الزحمة:** {busy}\n"
-        f"- **خرائط Google:** {mapslnك}\n"
+        f"- **خرائط Google:** {mapslnk}\n"
         f"- **الموقع الإلكتروني:** {webslnk}\n"
     )
 
