@@ -28,6 +28,7 @@ import markdown as md  # لتحويل Markdown إلى HTML قبل النشر
 # ========== Helpers for Places Integration (normalize + protected details) ==========
 import re, unicodedata as _ud
 from difflib import SequenceMatcher
+from urllib.parse import urlparse  # لعرض الدومين في الشريط الجانبي
 
 _AR_DIAC = re.compile(r'[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]')
 _PUNCT  = re.compile(r'[^\w\s\u0600-\u06FF]')
@@ -126,6 +127,61 @@ def inject_details_under_h3(markdown_text: str, places_index: dict) -> str:
     return "\n".join(out)
 # ========== End Helpers ======================================================
 
+# ========== Secrets helpers (Sidebar + WP) ==========
+def _get_secret_fuzzy(primary: str, aliases: tuple[str, ...] = ()):
+    """
+    يحاول يقرأ المفتاح من st.secrets أو من متغيرات البيئة مع دعم أسماء بديلة.
+    """
+    names = (primary,) + aliases
+    # 1) قراءة مباشرة
+    for nm in names:
+        v = None
+        try:
+            if hasattr(st, "secrets"):
+                v = st.secrets.get(nm)
+        except Exception:
+            v = None
+        if not v:
+            v = os.getenv(nm)
+        if isinstance(v, str):
+            v = v.strip()
+        if v:
+            return v
+
+    # 2) بحث غامض في st.secrets
+    try:
+        all_keys = list(getattr(st, "secrets", {}).keys())
+    except Exception:
+        all_keys = []
+    norm = lambda s: "".join(s.split()).lower() if isinstance(s, str) else ""
+    target_set = {norm(nm) for nm in names}
+    for k in all_keys:
+        if norm(k) in target_set:
+            v = st.secrets.get(k)
+            if isinstance(v, str):
+                v = v.strip()
+            if v:
+                return v
+    return None
+
+def _mask_value(val: str, show_last: int = 4) -> str:
+    if not val:
+        return "—"
+    s = str(val)
+    s_clean = "".join(s.split())
+    if len(s_clean) <= show_last:
+        return "•" * len(s_clean)
+    return "•" * (len(s_clean) - show_last) + s_clean[-show_last:]
+
+def _domain_from_url(u: str) -> str:
+    if not u: return "—"
+    try:
+        netloc = urlparse(u).netloc
+        return netloc or u
+    except Exception:
+        return u
+# =====================================================
+
 # ========== WordPress helper ==========
 def wp_publish_draft(title: str, markdown_body: str, slug: str = None,
                      categories=None, tags=None, status: str = "draft") -> dict:
@@ -134,9 +190,9 @@ def wp_publish_draft(title: str, markdown_body: str, slug: str = None,
     المتطلبات في secrets.toml:
       WP_BASE_URL, WP_USER, WP_APP_PASS
     """
-    base = (st.secrets.get("WP_BASE_URL") or os.getenv("WP_BASE_URL") or "").rstrip("/")
-    user = st.secrets.get("WP_USER") or os.getenv("WP_USER")
-    app_pass = st.secrets.get("WP_APP_PASS") or os.getenv("WP_APP_PASS")
+    base = (_get_secret_fuzzy("WP_BASE_URL", ("WP_URL","WORDPRESS_BASE_URL")) or "").rstrip("/")
+    user = _get_secret_fuzzy("WP_USER", ("WORDPRESS_USER","WP_USERNAME"))
+    app_pass = _get_secret_fuzzy("WP_APP_PASS", ("WP_APP_PASSWORD","WORDPRESS_APP_PASSWORD"))
     if not base or not user or not app_pass:
         raise RuntimeError("بيانات ووردبريس ناقصة: WP_BASE_URL / WP_USER / WP_APP_PASS")
 
@@ -237,6 +293,27 @@ internal_catalog = st.sidebar.text_area(
     "أدخل عناوين/سلاگز مقالاتك (سطر لكل عنصر)",
     "أفضل مطاعم الرياض\nأفضل مطاعم إفطار في الرياض\nأفضل مطاعم بيتزا في جدة"
 )
+
+# ====== إعدادات ووردبريس في الشريط الجانبي ======
+st.sidebar.markdown("---")
+st.sidebar.subheader("🗝️ إعدادات ووردبريس (للتحقق السريع)")
+
+wp_base_sb = _get_secret_fuzzy("WP_BASE_URL", aliases=("WP_URL", "WORDPRESS_BASE_URL"))
+wp_user_sb = _get_secret_fuzzy("WP_USER", aliases=("WORDPRESS_USER", "WP_USERNAME"))
+wp_pass_sb = _get_secret_fuzzy("WP_APP_PASS", aliases=("WP_APP_PASSWORD", "WORDPRESS_APP_PASSWORD"))
+
+st.sidebar.caption(
+    f"WP_BASE_URL: {'OK' if wp_base_sb else 'MISSING'} · "
+    f"WP_USER: {'OK' if wp_user_sb else 'MISSING'} · "
+    f"WP_APP_PASS: {'OK' if wp_pass_sb else 'MISSING'}"
+)
+
+reveal_wp = st.sidebar.checkbox("إظهار اسم المستخدم والدومين (لن نعرض كلمة المرور)", value=False)
+st.sidebar.write("**المضيف (الدومين):** ", _domain_from_url(wp_base_sb) if reveal_wp else "مخفي")
+st.sidebar.write("**اسم المستخدم:** ", (wp_user_sb or "—") if reveal_wp else _mask_value(wp_user_sb or "", show_last=0))
+st.sidebar.write("**كلمة مرور التطبيق:** ", _mask_value(wp_pass_sb or ""))  # دائمًا مُقنّعة
+if reveal_wp and wp_base_sb:
+    st.sidebar.markdown(f"[اختبار REST]({wp_base_sb.rstrip('/')}/wp-json/)")
 
 # Tabs (أضفنا تبويب Google كـ رابع تبويب)
 tab_article, tab_comp, tab_qc, tab_places = st.tabs([
@@ -453,7 +530,7 @@ with tab_article:
 
         if tone == "ناقد صارم | مراجعات الجمهور":
             tone_instructions = ("اكتب كنّاقد صارم يعتمد أساسًا على مراجعات العملاء المنشورة علنًا. "
-                                 "ركّز على الأنماط المتكررة واذكر حدود المنهجية. لا تدّعِ زيارة شخصية. لا تستخدم أرقام.")
+                                 "ركّز على الأنماط المتكررة واذكر حدود المنهجية. لا تدّعِ visita شخصية. لا تستخدم أرقام.")
             tone_selection_line = "اعتمدنا على مراجعات موثوقة منشورة علنًا حتى {last_updated}، مع التركيز على الأنماط المتكررة."
             system_tone = "أسلوب ناقد صارم مرتكز على مراجعات الجمهور"
         elif tone == "ناقد صارم | تجربة مباشرة + مراجعات":
@@ -559,25 +636,17 @@ with tab_article:
     st.markdown("---")
     st.subheader("📰 النشر على ووردبريس")
 
-    def _get_secret(name: str):
-        v = None
-        try:
-            if hasattr(st, "secrets"):
-                v = st.secrets.get(name)
-        except Exception:
-            v = None
-        if not v:
-            v = os.getenv(name)
-        if isinstance(v, str):
-            v = v.strip()
-        return v
-
-    wp_base = _get_secret("WP_BASE_URL")
-    wp_user = _get_secret("WP_USER")
-    wp_pass = _get_secret("WP_APP_PASS")
+    wp_base = _get_secret_fuzzy("WP_BASE_URL", aliases=("WP_URL", "WORDPRESS_BASE_URL"))
+    wp_user = _get_secret_fuzzy("WP_USER", aliases=("WORDPRESS_USER", "WP_USERNAME"))
+    wp_pass = _get_secret_fuzzy("WP_APP_PASS", aliases=("WP_APP_PASSWORD", "WORDPRESS_APP_PASSWORD"))
     wp_ready = all([wp_base, wp_user, wp_pass])
 
     # سطر تشخيصي بسيط (لا يعرض القيم)
+    try:
+        detected_keys = ", ".join(sorted(list(getattr(st, "secrets", {}).keys())))
+    except Exception:
+        detected_keys = "(لا يمكن قراءة st.secrets)"
+    st.caption("🔍 مفاتيح موجودة في st.secrets: " + detected_keys)
     st.caption(
         f"WP_BASE_URL: {'OK' if wp_base else 'MISSING'} · "
         f"WP_USER: {'OK' if wp_user else 'MISSING'} · "
