@@ -21,6 +21,107 @@ from utils.competitor_analysis import analyze_competitors, extract_gap_points
 from utils.quality_checks import quality_report
 from utils.llm_reviewer import llm_review, llm_fix
 
+# ========== Helpers for Places Integration (normalize + protected details) ==========
+import re, unicodedata as _ud
+from difflib import SequenceMatcher
+
+_AR_DIAC = re.compile(r'[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]')
+_PUNCT  = re.compile(r'[^\w\s\u0600-\u06FF]')
+
+def normalize_ar(s: str) -> str:
+    if not s: return ""
+    s = _ud.normalize("NFKC", s)
+    s = _AR_DIAC.sub("", s)
+    s = s.replace("أ","ا").replace("إ","ا").replace("آ","ا").replace("ى","ي")
+    s = s.replace("ؤ","و").replace("ئ","ي").replace("ة","ه").replace("ـ","")
+    s = _PUNCT.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    trans = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+    s = s.translate(trans)
+    return s
+
+def best_match(name: str, index: dict, threshold: float = 0.90):
+    key = normalize_ar(name)
+    if key in index:
+        return index[key]
+    best_key, best_score = None, 0.0
+    for k in index.keys():
+        sc = SequenceMatcher(None, key, k).ratio()
+        if sc > best_score:
+            best_key, best_score = k, sc
+    return index.get(best_key) if best_score >= threshold else None
+
+def _fmt(v):
+    return str(v).strip() if v and str(v).strip() else "غير متوفر"
+
+def _link(label, url):
+    return f"[{label}]({url})" if url and str(url).strip() else "غير متوفر"
+
+def render_details_block(item: dict) -> str:
+    address = _fmt(item.get("address"))
+    phone   = _fmt(item.get("phone"))
+    hours   = _fmt(item.get("thursday_hours"))
+    family  = _fmt(item.get("family_friendly"))  # "نعم (تقديري)" / "لا (تقديري)" / غير متوفر
+    pricepp = _fmt(item.get("price_per_person"))
+    dish    = _fmt(item.get("signature_dish"))   # "—" أو اسم طبق
+    busy    = _fmt(item.get("busy_times"))
+    mapslnk = _link("فتح في خرائط Google", item.get("maps_url"))
+    webslnk = _link("زيارة الموقع", item.get("website"))
+    return (
+        "\n**تفاصيل عملية:**\n"
+        f"- **العنوان:** {address}\n"
+        f"- **الهاتف:** {phone}\n"
+        f"- **الأوقات:** {hours}\n"
+        f"- **مناسب للعوائل:** {family}\n"
+        f"- **السعر للشخص:** {pricepp}\n"
+        f"- **الطبق المميز:** {dish}\n"
+        f"- **أوقات الزحمة:** {busy}\n"
+        f"- **خرائط Google:** {mapslnk}\n"
+        f"- **الموقع الإلكتروني:** {webslnk}\n"
+    )
+
+def inject_details_under_h3(markdown_text: str, places_index: dict) -> str:
+    """
+    بعد كل '### <اسم المطعم>' والفقرة الأولى التي تليه، أدرج كتلة 'تفاصيل عملية'
+    بمطابقة الاسم مع places_index (محمية 100%). إن لم نجد المطابقة، نعرض 'غير متوفر'.
+    """
+    if not markdown_text or not places_index:
+        return markdown_text
+
+    lines = markdown_text.splitlines()
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+
+        if line.startswith("### "):
+            h3_name = line[4:].strip()
+            # احتفظ بأي أسطر فارغة بعد H3
+            j = i + 1
+            while j < len(lines) and lines[j].strip() == "":
+                out.append(lines[j]); j += 1
+            # الفقرة الأولى (حتى سطر فارغ أو عنوان جديد)
+            while j < len(lines) and not lines[j].startswith("#") and lines[j].strip() != "":
+                out.append(lines[j]); j += 1
+
+            matched = best_match(h3_name, places_index, threshold=0.90)
+            if matched is None:
+                matched = {
+                    "address": None, "phone": None, "thursday_hours": None,
+                    "family_friendly": None, "price_per_person": None,
+                    "signature_dish": "—", "busy_times": None,
+                    "maps_url": None, "website": None
+                }
+            out.append(render_details_block(matched))
+            i = j
+            continue
+
+        i += 1
+
+    return "\n".join(out)
+# ========== End Helpers ======================================================
+
 # --- rerun آمن لنسخ ستريملت المختلفة ---
 def safe_rerun():
     if getattr(st, "rerun", None):
@@ -105,8 +206,13 @@ internal_catalog = st.sidebar.text_area(
     "أفضل مطاعم الرياض\nأفضل مطاعم إفطار في الرياض\nأفضل مطاعم بيتزا في جدة"
 )
 
-# Tabs
-tab_article, tab_comp, tab_qc = st.tabs(["✍️ توليد المقال", "🆚 تحليل المنافسين (روابط يدوية)", "🧪 فحص بشرية وجودة المحتوى"])
+# Tabs (أضفنا تبويب Google كـ رابع تبويب)
+tab_article, tab_comp, tab_qc, tab_places = st.tabs([
+    "✍️ توليد المقال",
+    "🆚 تحليل المنافسين (روابط يدوية)",
+    "🧪 فحص بشرية وجودة المحتوى",
+    "🌍 جلب مطاعم من Google"
+])
 
 # ------------------ Tab 1: Article Generation ------------------
 with tab_article:
@@ -262,7 +368,12 @@ with tab_article:
         else:
             criteria_block = st.session_state.get("criteria_generated_md_map", {}).get(effective_category, criteria_block)
 
-        restaurants_input = st.text_area("أدخل أسماء المطاعم (سطر لكل مطعم)", "مطعم 1\nمطعم 2\nمطعم 3", height=160)
+        # 🔁 (تعديل المرحلة 6): القراءة الافتراضية من session_state لو جاي من تبويب Google
+        restaurants_input = st.text_area(
+            "أدخل أسماء المطاعم (سطر لكل مطعم)",
+            st.session_state.get("restaurants_text", "مطعم 1\nمطعم 2\nمطعم 3"),
+            height=160
+        )
         st.markdown("**أو** ارفع ملف CSV بأسماء المطاعم (عمود: name)")
         csv_file = st.file_uploader("رفع CSV (اختياري)", type=["csv"], help="عمود name مطلوب؛ عمود note اختياري.")
 
@@ -366,6 +477,10 @@ with tab_article:
                 article_md = chat_complete(client, polish_messages, max_tokens=2400, temperature=0.8, model=primary_model, fallback_model=fallback_model)
             except Exception as e:
                 st.warning(f"طبقة اللمسات البشرية تعذّرت: {e}")
+
+        # 🔁 (المرحلة 7): حقن البطاقات المحمية 100% تحت كل H3 قبل الMeta/Links
+        if "places_index" in st.session_state and st.session_state["places_index"]:
+            article_md = inject_details_under_h3(article_md, st.session_state["places_index"])
 
         meta_prompt = f"صِغ عنوان SEO (≤ 60) ووصف ميتا (≤ 155) بالعربية لمقال بعنوان \"{article_title}\". الكلمة المفتاحية: {keyword}.\nTITLE: ...\nDESCRIPTION: ..."
         try:
@@ -537,3 +652,112 @@ with tab_qc:
             st.markdown("### النص بعد الإصلاح"); st.markdown(new_text)
             st.session_state["last_article_md"] = new_text
             st.success("تم الإصلاح الموضعي.")
+
+# ------------------ Tab 4: Google Places (الجديد) ------------------
+with tab_places:
+    st.subheader("ابحث عن مطاعم عبر Google Places")
+
+    # ملاحظة: تأكد أنك وضعت places_core.py في utils/integrations/
+    from utils.integrations.places_core import (
+        CITY_PRESETS,
+        places_search_text,
+        place_details,
+    )
+    # إن كانت لديك دوال إضافية في places_core:
+    try:
+        from utils.integrations.places_core import extract_thursday_times, map_price_level_to_range
+    except Exception:
+        extract_thursday_times = None
+        map_price_level_to_range = None
+
+    query = st.text_input("🔎 استعلام البحث (مثال: برجر بالرياض، بخاري جدة...)")
+    city_key = st.selectbox("🏙️ اختر مدينة", list(CITY_PRESETS.keys()))
+    max_results = st.number_input("🔢 الحد الأقصى للنتائج", min_value=1, max_value=20, value=10)
+    min_reviews = st.number_input("⭐ الحد الأدنى لعدد المراجعات", min_value=0, value=50)
+
+    def to_place_item(det: dict) -> dict:
+        name = (det.get("displayName") or {}).get("text") or ""
+        address = det.get("formattedAddress")
+        phone = det.get("nationalPhoneNumber")
+
+        # ساعات الخميس كسلسلة واحدة (بدون ذكر اليوم)
+        thu = None
+        if extract_thursday_times and det.get("regularOpeningHours"):
+            try:
+                thu = extract_thursday_times(det.get("regularOpeningHours", {})) or None
+            except Exception:
+                thu = None
+
+        # السعر للشخص
+        price_pp = None
+        lvl = det.get("priceLevel")
+        if lvl is not None and map_price_level_to_range:
+            try:
+                region = CITY_PRESETS[city_key].get("regionCode", "SA")
+                price_pp = map_price_level_to_range(lvl, region)
+            except Exception:
+                price_pp = None
+
+        busy = det.get("busy_times")  # قد لا تكون متوفرة
+
+        maps_url = det.get("googleMapsUri")
+        website  = det.get("websiteUri")
+
+        return {
+            "name": name,
+            "address": address,
+            "phone": phone,
+            "thursday_hours": thu,
+            "family_friendly": "نعم (تقديري)",  # حسب قرارك
+            "price_per_person": price_pp,
+            "signature_dish": "—",
+            "busy_times": busy,
+            "maps_url": maps_url,
+            "website": website,
+        }
+
+    if st.button("🚀 جلب النتائج"):
+        if not query:
+            st.warning("اكتب استعلامًا أولًا.")
+        else:
+            base_city = CITY_PRESETS[city_key]
+            results = places_search_text(
+                query,
+                base_city["lat"],
+                base_city["lng"],
+                max_results=int(max_results),
+                region_code=base_city.get("regionCode", "SA")
+            )
+
+            items = []
+            for p in results:
+                det = place_details(p["id"])
+                if min_reviews:
+                    if det.get("userRatingCount") is not None and det["userRatingCount"] < int(min_reviews):
+                        continue
+                items.append(to_place_item(det))
+
+            st.session_state["places_items"] = items
+            st.session_state["places_index"] = { normalize_ar(it["name"]): it for it in items }
+
+            st.success(f"تم جلب {len(items)} مطعمًا.")
+            if items:
+                try:
+                    import pandas as pd
+                    df = pd.DataFrame([{
+                        "الاسم": it["name"],
+                        "العنوان": it["address"] or "غير متوفر",
+                        "السعر للشخص": it["price_per_person"] or "غير متوفر",
+                        "أوقات الزحمة": it["busy_times"] or "غير متوفر"
+                    } for it in items])
+                    st.dataframe(df, use_container_width=True)
+                except Exception:
+                    st.write("**أول 5 نتائج:**")
+                    for it in items[:5]:
+                        st.write("•", it["name"], "—", (it["address"] or "غير متوفر"))
+
+    if "places_items" in st.session_state and st.session_state["places_items"]:
+        if st.button("➕ أضِف الأسماء إلى حقل التوليد"):
+            restaurants_text = "\n".join([it["name"] for it in st.session_state["places_items"]])
+            st.session_state["restaurants_text"] = restaurants_text
+            st.success("تمت إضافة الأسماء إلى تبويب توليد المقال ✍️ — افتحه الآن.")
