@@ -127,103 +127,108 @@ def inject_details_under_h3(markdown_text: str, places_index: dict) -> str:
     return "\n".join(out)
 # ========== End Helpers ======================================================
 
-# ========== Secrets helpers (Sidebar + WP) ==========
-def _get_secret_fuzzy(primary: str, aliases: tuple[str, ...] = ()):
-    """
-    يحاول يقرأ المفتاح من st.secrets أو من متغيرات البيئة مع دعم أسماء بديلة.
-    """
-    names = (primary,) + aliases
-    # 1) قراءة مباشرة
-    for nm in names:
-        v = None
-        try:
-            if hasattr(st, "secrets"):
-                v = st.secrets.get(nm)
-        except Exception:
-            v = None
-        if not v:
-            v = os.getenv(nm)
-        if isinstance(v, str):
-            v = v.strip()
-        if v:
-            return v
+# ========== (جديد) Helpers لفرض الأقسام واللمسات والطول ==========
+def _word_count(md: str) -> int:
+    """عدّ كلمات عربي/لاتيني بعد إزالة ماركداون بسيطة."""
+    txt = re.sub(r"[#>*_`~\[\]\(\)]", " ", md or "")
+    tokens = re.findall(r"[\u0600-\u06FF\w]+", txt, flags=re.UNICODE)
+    return len(tokens)
 
-    # 2) بحث غامض في st.secrets
-    try:
-        all_keys = list(getattr(st, "secrets", {}).keys())
-    except Exception:
-        all_keys = []
-    norm = lambda s: "".join(s.split()).lower() if isinstance(s, str) else ""
-    target_set = {norm(nm) for nm in names}
-    for k in all_keys:
-        if norm(k) in target_set:
-            v = st.secrets.get(k)
-            if isinstance(v, str):
-                v = v.strip()
-            if v:
-                return v
-    return None
+FAQ_PATTERNS = [
+    r"^##\s*FAQ\s*$",
+    r"^##\s*الأسئلة\s+الشائعة\s*$",
+    r"^##\s*أسئلة\s+شائعة\s*$",
+]
+METH_PATTERNS = [
+    r"^##\s*منهجية\s*التحرير\s*$",
+    r"^##\s*منهجية\s*$",
+    r"^##\s*طريقة\s*العمل\s*$",
+]
 
-def _mask_value(val: str, show_last: int = 4) -> str:
-    if not val:
-        return "—"
-    s = str(val)
-    s_clean = "".join(s.split())
-    if len(s_clean) <= show_last:
-        return "•" * len(s_clean)
-    return "•" * (len(s_clean) - show_last) + s_clean[-show_last:]
-
-def _domain_from_url(u: str) -> str:
-    if not u: return "—"
-    try:
-        netloc = urlparse(u).netloc
-        return netloc or u
-    except Exception:
-        return u
-# =====================================================
-
-# ========== WordPress helper ==========
-def wp_publish_draft(title: str, markdown_body: str, slug: str = None,
-                     categories=None, tags=None, status: str = "draft") -> dict:
-    """
-    ينشر المقال كمسودة على ووردبريس عبر REST API.
-    المتطلبات في secrets.toml:
-      WP_BASE_URL, WP_USER, WP_APP_PASS
-    """
-    base = (_get_secret_fuzzy("WP_BASE_URL", ("WP_URL","WORDPRESS_BASE_URL")) or "").rstrip("/")
-    user = _get_secret_fuzzy("WP_USER", ("WORDPRESS_USER","WP_USERNAME"))
-    app_pass = _get_secret_fuzzy("WP_APP_PASS", ("WP_APP_PASSWORD","WORDPRESS_APP_PASSWORD"))
-    if not base or not user or not app_pass:
-        raise RuntimeError("بيانات ووردبريس ناقصة: WP_BASE_URL / WP_USER / WP_APP_PASS")
-
-    # تحويل Markdown → HTML
-    html = md.markdown(markdown_body or "", extensions=["extra", "sane_lists"])
-
-    url = f"{base}/wp-json/wp/v2/posts"
-    payload = {"title": title or "بدون عنوان", "content": html, "status": status}
-    if slug: payload["slug"] = slug
-    if categories: payload["categories"] = categories
-    if tags: payload["tags"] = tags
-
-    resp = requests.post(url, json=payload, auth=(user, app_pass), timeout=45)
-    resp.raise_for_status()
-    return resp.json()
-# ======================================
-
-# --- rerun آمن لنسخ ستريملت المختلفة ---
-def safe_rerun():
-    if getattr(st, "rerun", None):
-        st.rerun()  # Streamlit >= 1.30
-    else:
-        st.experimental_rerun()  # الإصدارات الأقدم
-
-st.set_page_config(page_title="مولد مقالات المطاعم (E-E-A-T)", page_icon="🍽️", layout="wide")
-st.title("🍽️ مولد مقالات المطاعم — E-E-A-T + Human Touch + منافسين + فحص بشرية")
+def _has_section(md: str, patterns) -> bool:
+    if not md: return False
+    for p in patterns:
+        if re.search(p, md, flags=re.IGNORECASE | re.MULTILINE | re.UNICODE):
+            return True
+    return False
 
 PROMPTS_DIR = Path("prompts")
 def read_prompt(name: str) -> str:
     return (PROMPTS_DIR / name).read_text(encoding="utf-8")
 
+def _read_template_file(name: str) -> str:
+    """يقرأ من prompts/<name>، وإن لم يوجد جرّب المسار الجذري."""
+    try:
+        return read_prompt(name)
+    except Exception:
+        p = Path(name)
+        return p.read_text(encoding="utf-8") if p.exists() else ""
+
+def ensure_sections(article_md: str, need_faq: bool, need_meth: bool) -> str:
+    """يدرج FAQ/منهجية إن غابا، من القوالب faq.md/methodology.md."""
+    out = article_md or ""
+    if need_faq and not _has_section(out, FAQ_PATTERNS):
+        faq_block = _read_template_file("faq.md").strip()
+        if faq_block:
+            out += ("\n\n" + faq_block + "\n")
+    if need_meth and not _has_section(out, METH_PATTERNS):
+        meth_block = _read_template_file("methodology.md").strip()
+        if meth_block:
+            out += ("\n\n" + meth_block + "\n")
+    return out
+
+def add_human_fallback(article_md: str) -> str:
+    """Fallback بسيط لو لم تنجح طبقة Polish."""
+    if re.search(r"^##\s*لمسات\s+بشرية\s*$", article_md or "", flags=re.MULTILINE):
+        return article_md
+    extra = (
+        "\n\n## لمسات بشرية\n"
+        "• تجارب مباشرة قابلة للتحقق: زيارات فعلية وتذوّق أطباق محددة.\n"
+        "• مصادر موثوقة: مراجعات موثقة وبيانات رسمية من المواقع.\n"
+        "• تفاصيل عملية: سعر تقريبي، أفضل وقت للزيارة، نصيحة للذروة.\n"
+        "• شفافية: التنبيه لإمكانية تغيّر القوائم/الأسعار.\n"
+    )
+    return (article_md or "") + extra
+
+def enforce_word_target_via_llm(client, primary_model, fallback_model, article_md: str,
+                                target_words: int, tolerance_pct: int = 12) -> str:
+    """يوسّع/يختصر للوصول إلى الهدف مع الحفاظ على العناوين وFAQ/المنهجية."""
+    wc = _word_count(article_md)
+    low = int(target_words * (1 - tolerance_pct/100))
+    high = int(target_words * (1 + tolerance_pct/100))
+    if low <= wc <= high:
+        return article_md
+
+    if wc < low:
+        delta = low - wc
+        instr = (
+            f"وسّع المحتوى بنحو ~{delta} كلمة ليصبح قريبًا من {target_words} كلمة، "
+            "مع الحفاظ على البنية والعناوين كما هي. أضف تفاصيل عملية موثوقة "
+            "وتجنّب الحشو والمجاز. لا تحذف قسمي FAQ ومنهجية التحرير إن وُجدا."
+        )
+    else:
+        delta = wc - high
+        instr = (
+            f"اختصر المحتوى بنحو ~{delta} كلمة ليصبح قريبًا من {target_words} كلمة، "
+            "مع إزالة التكرار والحشو مع الحفاظ على البنية والعناوين. لا تلمس FAQ ومنهجية التحرير."
+        )
+
+    messages = [
+        {"role": "system", "content": "أنت محرر عربي يوازن بين الإيجاز والإشباع ويحافظ على البنية."},
+        {"role": "user", "content": f"النص الحالي (لا تغيّر العناوين):\n\n{article_md}\n\nالتعليمات:\n{instr}"},
+    ]
+    try:
+        refined = chat_complete(client, messages, max_tokens=2400, temperature=0.3,
+                                model=primary_model, fallback_model=fallback_model)
+        return refined or article_md
+    except Exception:
+        return article_md
+# ========== End enforce helpers =============================================
+
+st.set_page_config(page_title="مولد مقالات المطاعم (E-E-A-T)", page_icon="🍽️", layout="wide")
+st.title("🍽️ مولد مقالات المطاعم — E-E-A-T + Human Touch + منافسين + فحص بشرية")
+
+# (نُبقي على تحميل القوالب كما هي لديك)
 BASE_TMPL = read_prompt("base.md")
 POLISH_TMPL = read_prompt("polish.md")
 FAQ_TMPL = read_prompt("faq.md")
@@ -281,6 +286,7 @@ include_faq = st.sidebar.checkbox("إضافة قسم FAQ", value=True)
 include_methodology = st.sidebar.checkbox("إضافة منهجية التحرير", value=True)
 add_human_touch = st.sidebar.checkbox("تفعيل طبقة اللمسات البشرية (Polish)", value=True)
 approx_len = st.sidebar.slider("الطول التقريبي (كلمات)", 600, 1800, 1100, step=100)
+# (الهامش 12% ثابت — يمكن ترقية الواجهة لاحقًا إن أردت)
 
 review_weight = None
 if tone in ["ناقد صارم | مراجعات الجمهور", "ناقد صارم | تجربة مباشرة + مراجعات"]:
@@ -298,17 +304,63 @@ internal_catalog = st.sidebar.text_area(
 st.sidebar.markdown("---")
 st.sidebar.subheader("🗝️ إعدادات ووردبريس (للتحقق السريع)")
 
-wp_base_sb = _get_secret_fuzzy("WP_BASE_URL", aliases=("WP_URL", "WORDPRESS_BASE_URL"))
-wp_user_sb = _get_secret_fuzzy("WP_USER", aliases=("WORDPRESS_USER", "WP_USERNAME"))
-wp_pass_sb = _get_secret_fuzzy("WP_APP_PASS", aliases=("WP_APP_PASSWORD", "WORDPRESS_APP_PASSWORD"))
+def _get_secret_fuzzy(primary: str, aliases: tuple[str, ...] = ()):
+    names = (primary,) + aliases
+    for nm in names:
+        v = None
+        try:
+            if hasattr(st, "secrets"):
+                v = st.secrets.get(nm)
+        except Exception:
+            v = None
+        if not v:
+            v = os.getenv(nm)
+        if isinstance(v, str):
+            v = v.strip()
+        if v:
+            return v
+    try:
+        all_keys = list(getattr(st, "secrets", {}).keys())
+    except Exception:
+        all_keys = []
+    norm = lambda s: "".join(s.split()).lower() if isinstance(s, str) else ""
+    target_set = {norm(nm) for nm in names}
+    for k in all_keys:
+        if norm(k) in target_set:
+            v = st.secrets.get(k)
+            if isinstance(v, str):
+                v = v.strip()
+            if v:
+                return v
+    return None
+
+def _mask_value(val: str, show_last: int = 4) -> str:
+    if not val:
+        return "—"
+    s = str(val)
+    s_clean = "".join(s.split())
+    if len(s_clean) <= show_last:
+        return "•" * len(s_clean)
+    return "•" * (len(s_clean) - show_last) + s_clean[-show_last:]
+
+def _domain_from_url(u: str) -> str:
+    if not u: return "—"
+    try:
+        netloc = urlparse(u).netloc
+        return netloc or u
+    except Exception:
+        return u
 
 st.sidebar.caption(
-    f"WP_BASE_URL: {'OK' if wp_base_sb else 'MISSING'} · "
-    f"WP_USER: {'OK' if wp_user_sb else 'MISSING'} · "
-    f"WP_APP_PASS: {'OK' if wp_pass_sb else 'MISSING'}"
+    f"WP_BASE_URL: {'OK' if _get_secret_fuzzy('WP_BASE_URL', ('WP_URL','WORDPRESS_BASE_URL')) else 'MISSING'} · "
+    f"WP_USER: {'OK' if _get_secret_fuzzy('WP_USER', ('WORDPRESS_USER','WP_USERNAME')) else 'MISSING'} · "
+    f"WP_APP_PASS: {'OK' if _get_secret_fuzzy('WP_APP_PASS', ('WP_APP_PASSWORD','WORDPRESS_APP_PASSWORD')) else 'MISSING'}"
 )
 
 reveal_wp = st.sidebar.checkbox("إظهار اسم المستخدم والدومين (لن نعرض كلمة المرور)", value=False)
+wp_base_sb = _get_secret_fuzzy("WP_BASE_URL", aliases=("WP_URL", "WORDPRESS_BASE_URL"))
+wp_user_sb = _get_secret_fuzzy("WP_USER", aliases=("WORDPRESS_USER", "WP_USERNAME"))
+wp_pass_sb = _get_secret_fuzzy("WP_APP_PASS", aliases=("WP_APP_PASSWORD", "WORDPRESS_APP_PASSWORD"))
 st.sidebar.write("**المضيف (الدومين):** ", _domain_from_url(wp_base_sb) if reveal_wp else "مخفي")
 st.sidebar.write("**اسم المستخدم:** ", (wp_user_sb or "—") if reveal_wp else _mask_value(wp_user_sb or "", show_last=0))
 st.sidebar.write("**كلمة مرور التطبيق:** ", _mask_value(wp_pass_sb or ""))  # دائمًا مُقنّعة
@@ -399,7 +451,6 @@ with tab_article:
             """حوّل أي ناتج (list/tuple/dict/str JSON) إلى قائمة نصوص نظيفة بلا undefined."""
             if raw is None:
                 return []
-            # لو نص قد يكون JSON
             if isinstance(raw, str):
                 s = raw.strip()
                 if s.startswith(("[", "{")):
@@ -411,7 +462,6 @@ with tab_article:
                 else:
                     lines = [ln.strip(" -•\t").strip() for ln in s.splitlines() if ln.strip()]
                     return [ln for ln in lines if ln and ln.lower() != "undefined"]
-            # لو dict: جرّب مفاتيح شائعة أو خذ القيم/المفاتيح
             if isinstance(raw, dict):
                 for k in ("criteria", "bullets", "items", "list"):
                     if k in raw:
@@ -420,7 +470,6 @@ with tab_article:
                 else:
                     vals = list(raw.values())
                     raw = vals if all(isinstance(v, str) for v in vals) else list(raw.keys())
-            # اعتبرها قائمة
             if isinstance(raw, (list, tuple)):
                 out = []
                 for x in raw:
@@ -454,30 +503,27 @@ with tab_article:
                     catalog_path="data/criteria_catalog.yaml"
                 )
                 md_ = _format_criteria_md(crit_list)
-                # نظّف أي قيمة قديمة مخزنة
                 st.session_state["criteria_generated_md_map"].pop(effective_category, None)
                 st.session_state["criteria_generated_md_map"][effective_category] = md_
 
                 if is_custom_category:
-                    # لا نلمس مفتاح الويجت مباشرة؛ نحفظ قيمة معلّقة ثم rerun
                     st.session_state["pending_custom_criteria_text"] = md_
-                    safe_rerun()
+                    if getattr(st, "rerun", None):
+                        st.rerun()
+                    else:
+                        st.experimental_rerun()
                 else:
                     st.success("تم توليد المعايير وحفظها.")
 
-            # (اختياري) عرض آخر توليد محفوظ لهذه الفئة
             if effective_category in st.session_state["criteria_generated_md_map"]:
                 st.markdown("**المعايير (تلقائي):**")
                 st.markdown(st.session_state["criteria_generated_md_map"][effective_category])
-        # ---------- /انتهى ----------
 
-        # مصدر criteria_block النهائي
         if is_custom_category:
             criteria_block = st.session_state.get("custom_criteria_text", criteria_block)
         else:
             criteria_block = st.session_state.get("criteria_generated_md_map", {}).get(effective_category, criteria_block)
 
-        # يقرأ الأسماء التي أضيفت من تبويب Google (إن وُجدت)
         restaurants_input = st.text_area(
             "أدخل أسماء المطاعم (سطر لكل مطعم)",
             st.session_state.get("restaurants_text", "مطعم 1\nمطعم 2\nمطعم 3"),
@@ -574,6 +620,7 @@ with tab_article:
             st.error(f"فشل التوليد: {e}")
             st.stop()
 
+        # --- طبقة Polish (كما في نسختك) ---
         apply_polish = add_human_touch or any(checks.values())
         merged_user_notes = (st.session_state.get("comp_gap_notes","") + "\n" + (manual_notes or "")).strip()
         if apply_polish or merged_user_notes:
@@ -586,6 +633,19 @@ with tab_article:
                 article_md = chat_complete(client, polish_messages, max_tokens=2400, temperature=0.8, model=primary_model, fallback_model=fallback_model)
             except Exception as e:
                 st.warning(f"طبقة اللمسات البشرية تعذّرت: {e}")
+
+        # --- ✅ فرض الأقسام واللمسات والطول بعد التوليد ---
+        # 1) ضمان وجود FAQ ومنهجية التحرير إن تم تفعيلهما
+        article_md = ensure_sections(article_md, need_faq=include_faq, need_meth=include_methodology)
+
+        # 2) fallback لمسات بشرية إن اخترتها وفشل الـ LLM في تحسين واضح
+        if add_human_touch:
+            article_md = add_human_fallback(article_md)
+
+        # 3) ضبط الطول التقريبي ±12%
+        article_md = enforce_word_target_via_llm(
+            client, primary_model, fallback_model, article_md, target_words=int(approx_len), tolerance_pct=12
+        )
 
         # 🔁 حقن البطاقات المحمية 100% تحت كل H3 قبل الMeta/Links
         if "places_index" in st.session_state and st.session_state["places_index"]:
@@ -641,7 +701,6 @@ with tab_article:
     wp_pass = _get_secret_fuzzy("WP_APP_PASS", aliases=("WP_APP_PASSWORD", "WORDPRESS_APP_PASSWORD"))
     wp_ready = all([wp_base, wp_user, wp_pass])
 
-    # سطر تشخيصي بسيط (لا يعرض القيم)
     try:
         detected_keys = ", ".join(sorted(list(getattr(st, "secrets", {}).keys())))
     except Exception:
@@ -653,6 +712,12 @@ with tab_article:
         f"WP_APP_PASS: {'OK' if wp_pass else 'MISSING'}"
     )
 
+    def slugify(name: str) -> str:
+        s = ''.join(c for c in unicodedata.normalize('NFKD', name) if not unicodedata.combining(c))
+        import re as _re
+        s = _re.sub(r'\W+', '_', s).strip('_').lower()
+        return s or "custom"
+
     current_title = st.session_state.get("last_title") or ""
     default_slug = slugify(current_title) if current_title else slugify(st.session_state.get('last_article_md', '')[:40] or "article")
 
@@ -663,6 +728,23 @@ with tab_article:
     with pcol2:
         cattxt = st.text_input("IDs للتصنيفات (اختياري، مفصولة بفواصل)", "")
         tagtxt = st.text_input("IDs للوسوم (اختياري، مفصولة بفواصل)", "")
+
+    def wp_publish_draft(title: str, markdown_body: str, slug: str = None,
+                         categories=None, tags=None, status: str = "draft") -> dict:
+        base = (_get_secret_fuzzy("WP_BASE_URL", ("WP_URL","WORDPRESS_BASE_URL")) or "").rstrip("/")
+        user = _get_secret_fuzzy("WP_USER", ("WORDPRESS_USER","WP_USERNAME"))
+        app_pass = _get_secret_fuzzy("WP_APP_PASS", ("WP_APP_PASSWORD","WORDPRESS_APP_PASSWORD"))
+        if not base or not user or not app_pass:
+            raise RuntimeError("بيانات ووردبريس ناقصة: WP_BASE_URL / WP_USER / WP_APP_PASS")
+        html = md.markdown(markdown_body or "", extensions=["extra", "sane_lists"])
+        url = f"{base}/wp-json/wp/v2/posts"
+        payload = {"title": title or "بدون عنوان", "content": html, "status": status}
+        if slug: payload["slug"] = slug
+        if categories: payload["categories"] = categories
+        if tags: payload["tags"] = tags
+        resp = requests.post(url, json=payload, auth=(user, app_pass), timeout=45)
+        resp.raise_for_status()
+        return resp.json()
 
     if not wp_ready:
         st.info("المفاتيح ناقصة أو فارغة. أضف WP_BASE_URL و WP_USER و WP_APP_PASS إلى secrets.toml ثم اضغط Restart.")
@@ -847,15 +929,13 @@ with tab_places:
         if not query:
             st.warning("اكتب استعلامًا أولًا.")
         else:
-            # 1) بحث نصي حسب تواقيع places_core
             places = places_search_text(
                 api_key,
                 query,
-                city_key,                      # مفتاح المدينة كما في CITY_PRESETS
+                city_key,
                 max_results=int(max_results),
             )
 
-            # 2) بناء عناصر جاهزة بالحقول المطلوبة
             region_code = CITY_PRESETS[city_key].get("regionCode", "SA")
             items_raw = make_items_from_places(
                 api_key,
@@ -864,7 +944,6 @@ with tab_places:
                 region_code=region_code,
             )
 
-            # 3) تحويل مفاتيح places_core إلى صيغة البطاقات المحمية
             def convert_item(r: dict) -> dict:
                 return {
                     "name": r.get("name", ""),
@@ -881,7 +960,6 @@ with tab_places:
 
             items = [convert_item(r) for r in items_raw]
 
-            # 4) تخزين في الجلسة + فهرس بالأسماء المطبَّعة
             st.session_state["places_items"] = items
             st.session_state["places_index"] = { normalize_ar(it["name"]): it for it in items }
 
